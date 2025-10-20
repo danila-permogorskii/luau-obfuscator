@@ -1,0 +1,55 @@
+[package]
+name = "luau-obfuscator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luau Obfuscator Team"]
+description = "Commercial Luau/Roblox script obfuscation CLI tool"
+license = "MIT"
+repository = "https://github.com/danila-permogorskii/luau-obfuscator"
+
+[dependencies]
+# CLI Framework
+clap = { version = "4.5", features = ["derive", "cargo"] }
+
+# Luau Parser
+full_moon = "0.19"
+
+# Cryptography
+ring = "0.17"
+argon2 = "0.5"
+rand = "0.8"
+
+# Error Handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging & Progress
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP Client (for API)
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Utilities
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+
+[[bench]]
+name = "obfuscation_performance"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
