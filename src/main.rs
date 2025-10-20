@@ -3,6 +3,7 @@
 //! A commercial-grade CLI tool for obfuscating Luau/Roblox scripts with
 //! cryptographic protection and license management.
 
+mod analysis;
 mod cli;
 mod parser;
 mod utils;
