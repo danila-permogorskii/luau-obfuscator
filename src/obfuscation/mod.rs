@@ -195,6 +195,13 @@ impl ObfuscatedScript {
     }
 }
 
+/// Obfuscation result for code generation
+#[derive(Debug, Clone)]
+pub struct ObfuscationResult {
+    /// The obfuscated code ready for final assembly
+    pub code: String,
+}
+
 /// Encrypted string with metadata
 #[derive(Debug, Clone)]
 pub struct EncryptedString {
