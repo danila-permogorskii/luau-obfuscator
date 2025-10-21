@@ -5,6 +5,9 @@
 
 mod analysis;
 mod cli;
+mod codegen;
+mod crypto;
+mod obfuscation;
 mod parser;
 mod utils;
 
