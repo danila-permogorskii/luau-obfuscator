@@ -4,6 +4,7 @@
 //! cryptographic protection and license management.
 
 mod analysis;
+mod api;
 mod cli;
 mod codegen;
 mod crypto;
