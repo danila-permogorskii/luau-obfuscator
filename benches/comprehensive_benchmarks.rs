@@ -1,301 +1,474 @@
-//! Performance benchmarks for critical operations
+//! Performance benchmarks for obfuscation operations
+//!
+//! These benchmarks measure:
+//! - End-to-end obfuscation time across all tiers
+//! - Individual transformation performance
+//! - Parsing performance for various script sizes
+//! - Cryptographic operations performance
+//! - Memory usage and allocation patterns
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use luau_obfuscator::{
-    analysis::Analyzer,
-    cli::args::ObfuscationTier,
-    crypto::CryptoContext,
-    obfuscation::Obfuscator,
+    analysis::{AnalysisEngine, AnalysisOptions},
+    crypto::{CryptoEngine, KdfParams},
+    obfuscation::{ObfuscationEngine, ObfuscationTier},
     parser::LuauParser,
 };
-use std::fs;
+use std::time::Duration;
 
-/// Benchmark Luau parsing performance
-fn benchmark_parsing(c: &mut Criterion) {
-    let simple_script = fs::read_to_string("tests/fixtures/sample_scripts/simple.lua")
-        .expect("Failed to read simple fixture");
+// Sample scripts of varying complexity
+const SIMPLE_SCRIPT: &str = r#"
+local message = "Hello, World!"
+print(message)
+"#;
 
-    let complex_script = fs::read_to_string("tests/fixtures/sample_scripts/complex.lua")
-        .expect("Failed to read complex fixture");
+const MEDIUM_SCRIPT: &str = r#"
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-    let roblox_script = fs::read_to_string("tests/fixtures/sample_scripts/roblox_api.lua")
-        .expect("Failed to read roblox fixture");
+local function greetPlayer(player)
+    local message = "Welcome, " .. player.Name .. "!"
+    print(message)
+    
+    local data = {
+        userId = player.UserId,
+        name = player.Name,
+        joinTime = tick()
+    }
+    
+    return data
+end
 
+local function processData(data)
+    for i = 1, 10 do
+        local result = data.userId * i
+        if result > 100 then
+            print("High value detected: " .. result)
+        end
+    end
+end
+
+Players.PlayerAdded:Connect(function(player)
+    local playerData = greetPlayer(player)
+    processData(playerData)
+end)
+"#;
+
+const LARGE_SCRIPT: &str = r#"
+-- Complex admin command system
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+local AdminModule = {}
+AdminModule.Version = "2.0.1"
+AdminModule.Commands = {}
+
+-- Command registration
+function AdminModule:RegisterCommand(name, aliases, callback, permission)
+    self.Commands[name] = {
+        name = name,
+        aliases = aliases or {},
+        callback = callback,
+        permission = permission or 0
+    }
+end
+
+-- User permission checking
+function AdminModule:HasPermission(player, level)
+    local userId = player.UserId
+    local permissions = {
+        [123456] = 3,  -- Owner
+        [789012] = 2,  -- Admin
+        [345678] = 1   -- Moderator
+    }
+    return (permissions[userId] or 0) >= level
+end
+
+-- Kick command
+AdminModule:RegisterCommand("kick", {"boot"}, function(caller, target)
+    if AdminModule:HasPermission(caller, 2) then
+        if target then
+            target:Kick("You have been kicked by " .. caller.Name)
+            return true, "Player kicked successfully"
+        end
+    end
+    return false, "Insufficient permissions or invalid target"
+end, 2)
+
+-- Ban command
+AdminModule:RegisterCommand("ban", {"permaban"}, function(caller, target)
+    if AdminModule:HasPermission(caller, 3) then
+        if target then
+            local banData = {
+                userId = target.UserId,
+                bannedBy = caller.UserId,
+                timestamp = tick(),
+                reason = "Banned by admin"
+            }
+            -- Store ban data
+            target:Kick("You have been banned")
+            return true, "Player banned successfully"
+        end
+    end
+    return false, "Insufficient permissions or invalid target"
+end, 3)
+
+-- Teleport command
+AdminModule:RegisterCommand("teleport", {"tp"}, function(caller, target, destination)
+    if AdminModule:HasPermission(caller, 1) then
+        if target and destination then
+            if target.Character and destination.Character then
+                target.Character:MoveTo(destination.Character.Position)
+                return true, "Teleported successfully"
+            end
+        end
+    end
+    return false, "Invalid teleport parameters"
+end, 1)
+
+-- Execute command parser
+function AdminModule:ParseCommand(player, message)
+    local parts = message:split(" ")
+    local commandName = parts[1]:lower():sub(2) -- Remove prefix
+    
+    for name, data in pairs(self.Commands) do
+        if name == commandName or table.find(data.aliases, commandName) then
+            local args = {table.unpack(parts, 2)}
+            local success, result = data.callback(player, table.unpack(args))
+            return success, result
+        end
+    end
+    
+    return false, "Unknown command"
+end
+
+-- Event handlers
+Players.PlayerAdded:Connect(function(player)
+    player.Chatted:Connect(function(message)
+        if message:sub(1, 1) == ":" then
+            local success, result = AdminModule:ParseCommand(player, message)
+            if success then
+                print("[Admin] " .. result)
+            else
+                warn("[Admin] Error: " .. result)
+            end
+        end
+    end)
+end)
+
+return AdminModule
+"#;
+
+/// Generate a large script with many repetitive patterns
+fn generate_stress_test_script(lines: usize) -> String {
+    let mut script = String::new();
+    script.push_str("-- Stress test script\n");
+    script.push_str("local data = {}\n\n");
+    
+    for i in 0..lines {
+        script.push_str(&format!(
+            "local var{} = \"string value {}\"\n",
+            i, i
+        ));
+        script.push_str(&format!(
+            "local num{} = {}\n",
+            i, i * 42
+        ));
+        script.push_str(&format!(
+            "local func{} = function(x) return x * {} end\n",
+            i, i
+        ));
+        
+        if i % 10 == 0 {
+            script.push_str(&format!("table.insert(data, {{var = var{}, num = num{}, func = func{}}})\n", i, i, i));
+        }
+    }
+    
+    script.push_str("\nreturn data\n");
+    script
+}
+
+// Parsing benchmarks
+fn bench_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("parsing");
-
-    group.bench_function("parse_simple_script", |b| {
-        let parser = LuauParser::new();
-        b.iter(|| {
-            parser.parse(black_box(&simple_script)).unwrap();
+    
+    for (name, script) in &[
+        ("simple", SIMPLE_SCRIPT),
+        ("medium", MEDIUM_SCRIPT),
+        ("large", LARGE_SCRIPT),
+    ] {
+        group.throughput(Throughput::Bytes(script.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(name), script, |b, script| {
+            b.iter(|| {
+                let parser = LuauParser::new();
+                black_box(parser.parse(script).expect("Parse failed"))
+            });
         });
-    });
-
-    group.bench_function("parse_complex_script", |b| {
-        let parser = LuauParser::new();
-        b.iter(|| {
-            parser.parse(black_box(&complex_script)).unwrap();
-        });
-    });
-
-    group.bench_function("parse_roblox_api_script", |b| {
-        let parser = LuauParser::new();
-        b.iter(|| {
-            parser.parse(black_box(&roblox_script)).unwrap();
-        });
-    });
-
+    }
+    
     group.finish();
 }
 
-/// Benchmark analysis engine performance
-fn benchmark_analysis(c: &mut Criterion) {
-    let complex_script = fs::read_to_string("tests/fixtures/sample_scripts/complex.lua")
-        .expect("Failed to read complex fixture");
-
-    let parser = LuauParser::new();
-    let parse_result = parser.parse(&complex_script).unwrap();
-
+// Analysis benchmarks
+fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
-
-    group.bench_function("analyze_complex_script", |b| {
-        let analyzer = Analyzer::new();
-        b.iter(|| {
-            analyzer.analyze(black_box(&parse_result)).unwrap();
+    
+    for (name, script) in &[
+        ("simple", SIMPLE_SCRIPT),
+        ("medium", MEDIUM_SCRIPT),
+        ("large", LARGE_SCRIPT),
+    ] {
+        group.throughput(Throughput::Bytes(script.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(name), script, |b, script| {
+            let parser = LuauParser::new();
+            let ast = parser.parse(script).expect("Parse failed");
+            
+            b.iter(|| {
+                let options = AnalysisOptions::default();
+                let engine = AnalysisEngine::new(options);
+                black_box(engine.analyze(&ast).expect("Analysis failed"))
+            });
         });
-    });
-
+    }
+    
     group.finish();
 }
 
-/// Benchmark cryptography operations
-fn benchmark_crypto(c: &mut Criterion) {
+// Cryptographic operation benchmarks
+fn bench_crypto(c: &mut Criterion) {
     let mut group = c.benchmark_group("crypto");
-
-    // Key derivation (Argon2id)
-    group.bench_function("argon2id_key_derivation", |b| {
-        use luau_obfuscator::crypto::KeyDerivation;
-        let kdf = KeyDerivation::new();
-        let password = b"benchmark_password";
-        let salt = b"0123456789abcdef";
-
+    group.measurement_time(Duration::from_secs(10)); // Longer measurement for crypto
+    
+    // Argon2id KDF benchmark
+    group.bench_function("argon2id_kdf", |b| {
+        let params = KdfParams {
+            memory_cost: 262144, // 256 MiB
+            time_cost: 4,
+            parallelism: 2,
+        };
+        
         b.iter(|| {
-            kdf.derive_key(black_box(password), black_box(salt))
-                .unwrap();
+            let engine = CryptoEngine::new(params);
+            black_box(engine.derive_key("test_password", b"salt_bytes_12345"))
         });
     });
-
-    // AES-256-GCM encryption
-    group.bench_function("aes_256_gcm_encrypt", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-        let plaintext = b"Hello, Roblox! This is a test string for encryption benchmarking.";
-
+    
+    // AES-256-GCM encryption benchmark
+    group.bench_function("aes_gcm_encrypt_small", |b| {
+        let params = KdfParams::default();
+        let engine = CryptoEngine::new(params);
+        let key = engine.derive_key("password", b"salt_bytes_12345").expect("KDF failed");
+        let plaintext = b"Small test data for encryption";
+        
         b.iter(|| {
-            crypto_ctx.encrypt(black_box(plaintext)).unwrap();
+            black_box(engine.encrypt(&key, plaintext).expect("Encrypt failed"))
         });
     });
-
-    // AES-256-GCM decryption
-    group.bench_function("aes_256_gcm_decrypt", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-        let plaintext = b"Hello, Roblox! This is a test string for encryption benchmarking.";
-        let encrypted = crypto_ctx.encrypt(plaintext).unwrap();
-
+    
+    group.bench_function("aes_gcm_encrypt_large", |b| {
+        let params = KdfParams::default();
+        let engine = CryptoEngine::new(params);
+        let key = engine.derive_key("password", b"salt_bytes_12345").expect("KDF failed");
+        let plaintext = vec![42u8; 10_000]; // 10 KB
+        
         b.iter(|| {
-            crypto_ctx.decrypt(black_box(&encrypted)).unwrap();
+            black_box(engine.encrypt(&key, &plaintext).expect("Encrypt failed"))
         });
     });
-
-    // Watermark generation
-    group.bench_function("watermark_generation", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-
+    
+    // AES-256-GCM decryption benchmark
+    group.bench_function("aes_gcm_decrypt", |b| {
+        let params = KdfParams::default();
+        let engine = CryptoEngine::new(params);
+        let key = engine.derive_key("password", b"salt_bytes_12345").expect("KDF failed");
+        let plaintext = b"Test data for decryption benchmark";
+        let ciphertext = engine.encrypt(&key, plaintext).expect("Encrypt failed");
+        
         b.iter(|| {
-            crypto_ctx.generate_watermark(
-                black_box("customer_12345"),
-                black_box("script_abc"),
-            );
+            black_box(engine.decrypt(&key, &ciphertext).expect("Decrypt failed"))
         });
     });
-
+    
     group.finish();
 }
 
-/// Benchmark obfuscation tiers
-fn benchmark_obfuscation_tiers(c: &mut Criterion) {
-    let complex_script = fs::read_to_string("tests/fixtures/sample_scripts/complex.lua")
-        .expect("Failed to read complex fixture");
-
-    let parser = LuauParser::new();
-    let parse_result = parser.parse(&complex_script).unwrap();
-
-    let analyzer = Analyzer::new();
-    let analysis = analyzer.analyze(&parse_result).unwrap();
-
+// Obfuscation tier benchmarks
+fn bench_obfuscation_tiers(c: &mut Criterion) {
     let mut group = c.benchmark_group("obfuscation_tiers");
-
-    // Basic tier
-    group.bench_function("obfuscate_basic_tier", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-        let obfuscator = Obfuscator::new(ObfuscationTier::Basic, crypto_ctx);
-
-        b.iter(|| {
-            obfuscator
-                .obfuscate(black_box(&parse_result), black_box(&analysis))
-                .unwrap();
-        });
-    });
-
-    // Standard tier
-    group.bench_function("obfuscate_standard_tier", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-        let obfuscator = Obfuscator::new(ObfuscationTier::Standard, crypto_ctx);
-
-        b.iter(|| {
-            obfuscator
-                .obfuscate(black_box(&parse_result), black_box(&analysis))
-                .unwrap();
-        });
-    });
-
-    // Premium tier
-    group.bench_function("obfuscate_premium_tier", |b| {
-        let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-        let obfuscator = Obfuscator::new(ObfuscationTier::Premium, crypto_ctx);
-
-        b.iter(|| {
-            obfuscator
-                .obfuscate(black_box(&parse_result), black_box(&analysis))
-                .unwrap();
-        });
-    });
-
+    group.measurement_time(Duration::from_secs(15));
+    
+    for (name, script) in &[
+        ("simple", SIMPLE_SCRIPT),
+        ("medium", MEDIUM_SCRIPT),
+        ("large", LARGE_SCRIPT),
+    ] {
+        for tier in &[
+            ObfuscationTier::Basic,
+            ObfuscationTier::Standard,
+            ObfuscationTier::Premium,
+        ] {
+            let bench_name = format!("{}_{:?}", name, tier);
+            group.bench_with_input(
+                BenchmarkId::from_parameter(bench_name),
+                &(script, tier),
+                |b, (script, tier)| {
+                    let parser = LuauParser::new();
+                    let ast = parser.parse(script).expect("Parse failed");
+                    
+                    let analysis_options = AnalysisOptions::default();
+                    let analysis_engine = AnalysisEngine::new(analysis_options);
+                    let analysis_result = analysis_engine.analyze(&ast).expect("Analysis failed");
+                    
+                    b.iter(|| {
+                        let engine = ObfuscationEngine::new(**tier);
+                        black_box(
+                            engine
+                                .obfuscate(&ast, &analysis_result)
+                                .expect("Obfuscation failed"),
+                        )
+                    });
+                },
+            );
+        }
+    }
+    
     group.finish();
 }
 
-/// Benchmark string encryption at scale
-fn benchmark_string_encryption_scale(c: &mut Criterion) {
-    let mut group = c.benchmark_group("string_encryption_scale");
+// End-to-end obfuscation pipeline benchmark
+fn bench_end_to_end(c: &mut Criterion) {
+    let mut group = c.benchmark_group("end_to_end");
+    group.measurement_time(Duration::from_secs(20));
+    group.sample_size(10); // Fewer samples for long-running benchmarks
+    
+    for (name, script) in &[
+        ("simple", SIMPLE_SCRIPT),
+        ("medium", MEDIUM_SCRIPT),
+        ("large", LARGE_SCRIPT),
+    ] {
+        for tier in &[
+            ObfuscationTier::Basic,
+            ObfuscationTier::Standard,
+            ObfuscationTier::Premium,
+        ] {
+            let bench_name = format!("{}_{:?}", name, tier);
+            group.throughput(Throughput::Bytes(script.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::from_parameter(bench_name),
+                &(script, tier),
+                |b, (script, tier)| {
+                    b.iter(|| {
+                        // Complete pipeline: Parse → Analyze → Obfuscate → Generate
+                        let parser = LuauParser::new();
+                        let ast = parser.parse(script).expect("Parse failed");
+                        
+                        let analysis_options = AnalysisOptions::default();
+                        let analysis_engine = AnalysisEngine::new(analysis_options);
+                        let analysis_result =
+                            analysis_engine.analyze(&ast).expect("Analysis failed");
+                        
+                        let obfuscation_engine = ObfuscationEngine::new(**tier);
+                        let obfuscated_ast = obfuscation_engine
+                            .obfuscate(&ast, &analysis_result)
+                            .expect("Obfuscation failed");
+                        
+                        // Code generation would go here in the real pipeline
+                        black_box(obfuscated_ast)
+                    });
+                },
+            );
+        }
+    }
+    
+    group.finish();
+}
 
-    for string_count in [10, 50, 100, 500].iter() {
-        group.throughput(Throughput::Elements(*string_count as u64));
-
+// Large script stress test benchmarks
+fn bench_stress_test(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stress_test");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
+    
+    for lines in &[1000, 5000, 10000] {
+        let script = generate_stress_test_script(*lines);
+        let bench_name = format!("{}_lines", lines);
+        
+        group.throughput(Throughput::Bytes(script.len() as u64));
         group.bench_with_input(
-            format!("{}_strings", string_count),
-            string_count,
-            |b, &count| {
-                let crypto_ctx = CryptoContext::new("benchmark", None).unwrap();
-
-                // Generate test strings
-                let strings: Vec<String> = (0..count)
-                    .map(|i| format!("Test string number {}", i))
-                    .collect();
-
-                b.iter_batched(
-                    || strings.clone(),
-                    |strings| {
-                        for s in strings {
-                            crypto_ctx.encrypt(s.as_bytes()).unwrap();
-                        }
-                    },
-                    BatchSize::SmallInput,
-                );
+            BenchmarkId::from_parameter(bench_name),
+            &script,
+            |b, script| {
+                b.iter(|| {
+                    let parser = LuauParser::new();
+                    let ast = parser.parse(script).expect("Parse failed");
+                    
+                    let analysis_options = AnalysisOptions::default();
+                    let analysis_engine = AnalysisEngine::new(analysis_options);
+                    let analysis_result =
+                        analysis_engine.analyze(&ast).expect("Analysis failed");
+                    
+                    let obfuscation_engine = ObfuscationEngine::new(ObfuscationTier::Standard);
+                    black_box(
+                        obfuscation_engine
+                            .obfuscate(&ast, &analysis_result)
+                            .expect("Obfuscation failed"),
+                    )
+                });
             },
         );
     }
-
+    
     group.finish();
 }
 
-/// Benchmark large script handling
-fn benchmark_large_scripts(c: &mut Criterion) {
-    let mut group = c.benchmark_group("large_scripts");
-
-    // Generate large scripts of different sizes
-    let sizes = [1000, 5000, 10000, 20000];
-
-    for &size in sizes.iter() {
-        group.throughput(Throughput::Elements(size as u64));
-
-        group.bench_with_input(format!("{}_lines", size), &size, |b, &size| {
-            let large_script = format!(
-                "-- Large script test\n{}",
-                "local x = 1\nprint(x)\n".repeat(size as usize)
-            );
-
-            let parser = LuauParser::new();
-
-            b.iter(|| {
-                parser.parse(black_box(&large_script)).unwrap();
-            });
-        });
-    }
-
-    group.finish();
-}
-
-/// Benchmark name mangling performance
-fn benchmark_name_mangling(c: &mut Criterion) {
-    let complex_script = fs::read_to_string("tests/fixtures/sample_scripts/complex.lua")
-        .expect("Failed to read complex fixture");
-
-    let parser = LuauParser::new();
-    let parse_result = parser.parse(&complex_script).unwrap();
-
-    let analyzer = Analyzer::new();
-    let analysis = analyzer.analyze(&parse_result).unwrap();
-
-    let mut group = c.benchmark_group("name_mangling");
-
-    group.bench_function("mangle_identifiers", |b| {
-        use luau_obfuscator::obfuscation::NameMangler;
-        
+// Memory allocation benchmarks
+fn bench_memory_usage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memory_usage");
+    
+    // Benchmark memory efficiency of parsing
+    group.bench_function("parse_large_no_alloc", |b| {
+        let parser = LuauParser::new();
         b.iter(|| {
-            let mut mangler = NameMangler::new(&analysis.preserved_identifiers, true);
-            mangler.generate_mappings(black_box(&analysis)).unwrap();
+            black_box(parser.parse(LARGE_SCRIPT).expect("Parse failed"));
         });
     });
-
-    group.finish();
-}
-
-/// Benchmark dead code injection
-fn benchmark_dead_code_injection(c: &mut Criterion) {
-    let complex_script = fs::read_to_string("tests/fixtures/sample_scripts/complex.lua")
-        .expect("Failed to read complex fixture");
-
-    let parser = LuauParser::new();
-    let parse_result = parser.parse(&complex_script).unwrap();
-
-    let mut group = c.benchmark_group("dead_code_injection");
-
-    for &density in [0.1, 0.3, 0.5, 1.0].iter() {
-        group.bench_with_input(format!("density_{}", density), &density, |b, &density| {
-            use luau_obfuscator::obfuscation::DeadCodeInjector;
-            let injector = DeadCodeInjector::new(density);
-
-            b.iter(|| {
-                injector.generate(black_box(&parse_result)).unwrap();
-            });
+    
+    // Benchmark memory reuse in iterative processing
+    group.bench_function("repeated_obfuscation_reuse", |b| {
+        let parser = LuauParser::new();
+        let ast = parser.parse(MEDIUM_SCRIPT).expect("Parse failed");
+        
+        let analysis_options = AnalysisOptions::default();
+        let analysis_engine = AnalysisEngine::new(analysis_options);
+        let analysis_result = analysis_engine.analyze(&ast).expect("Analysis failed");
+        
+        let obfuscation_engine = ObfuscationEngine::new(ObfuscationTier::Basic);
+        
+        b.iter(|| {
+            // Simulate processing multiple scripts with same engine (memory reuse)
+            for _ in 0..10 {
+                black_box(
+                    obfuscation_engine
+                        .obfuscate(&ast, &analysis_result)
+                        .expect("Obfuscation failed"),
+                );
+            }
         });
-    }
-
+    });
+    
     group.finish();
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        .sample_size(100)
-        .measurement_time(std::time::Duration::from_secs(10));
-    targets = 
-        benchmark_parsing,
-        benchmark_analysis,
-        benchmark_crypto,
-        benchmark_obfuscation_tiers,
-        benchmark_string_encryption_scale,
-        benchmark_large_scripts,
-        benchmark_name_mangling,
-        benchmark_dead_code_injection
-}
+criterion_group!(
+    benches,
+    bench_parsing,
+    bench_analysis,
+    bench_crypto,
+    bench_obfuscation_tiers,
+    bench_end_to_end,
+    bench_stress_test,
+    bench_memory_usage
+);
 
 criterion_main!(benches);
